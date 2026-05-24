@@ -1,24 +1,56 @@
 const WebSocket = require('ws');
 const net = require('net');
+const http = require('http');
 const iconv = require('iconv-lite');
 const AnsiToHtml = require('ansi-to-html');
-const ansiToHtml = new AnsiToHtml({
-	escapeXML: true,
-	stream: true,
-});
 const he = require('he');
+const { createStreamDecoder } = require('./streamDecoder');
 
-const WS_PORT = 3000; // Port for WebSocket server
+const WS_PORT = Number(process.env.PORT || 3000);
 const WS_HOST = '0.0.0.0';
 
-const wss = new WebSocket.Server({ port: WS_PORT, host: WS_HOST });
+const server = http.createServer((req, res) => {
+	if (req.url === '/healthz') {
+		res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+		res.end('ok\n');
+		return;
+	}
+
+	if (req.url === '/' || req.url === '/favicon.ico') {
+		const body = JSON.stringify({
+			name: 'swiss-mud-proxy',
+			status: 'ok',
+			websocketUrl: `wss://${req.headers.host || 'swiss-mud-proxy.fly.dev'}`,
+		});
+
+		res.writeHead(req.url === '/' ? 200 : 204, {
+			'Content-Type': 'application/json; charset=utf-8',
+			'Cache-Control': 'no-store',
+		});
+		res.end(req.url === '/' ? `${body}\n` : '');
+		return;
+	}
+
+	res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+	res.end('not found\n');
+});
+
+const wss = new WebSocket.Server({ server });
+
+function toHtmlChunk(text, ansiToHtml, encoding) {
+	if (!text) return '';
+	let html = ansiToHtml.toHtml(text);
+	if (encoding !== 'utf8') {
+		html = he.decode(html);
+	}
+	return html;
+}
 
 wss.on('connection', (ws) => {
 	console.log('WebSocket client connected');
 	let mudSocket = null;
 
 	ws.once('message', (msg) => {
-		// Expect: { address, port, encoding }
 		let profile;
 		try {
 			profile = JSON.parse(msg);
@@ -26,23 +58,25 @@ wss.on('connection', (ws) => {
 			ws.close();
 			return;
 		}
+
 		const encoding = profile.encoding || 'utf8';
+		const streamDecoder = createStreamDecoder(encoding);
+		const ansiToHtml = new AnsiToHtml({
+			escapeXML: true,
+			stream: true,
+		});
+
 		mudSocket = net.createConnection(
 			{ host: profile.address, port: Number(profile.port) },
 			() => ws.send('[INFO] Connected to MUD server')
 		);
 
-		// Forward data from MUD to WebSocket
+		// Stream decoded text through ANSI→HTML; do not split on TCP chunk boundaries.
 		mudSocket.on('data', (data) => {
 			try {
-				// Decode using selected encoding, then convert ANSI codes to HTML
-				const decodedData = iconv.decode(data, encoding);
-				let htmlData = ansiToHtml.toHtml(decodedData);
-				if (encoding !== 'utf8') {
-					// Decode HTML entities back to Unicode
-					htmlData = he.decode(htmlData);
-				}
-				ws.send(htmlData);
+				const text = streamDecoder.write(data);
+				const html = toHtmlChunk(text, ansiToHtml, encoding);
+				if (html) ws.send(html);
 			} catch (err) {
 				console.error('Error decoding MUD data:', err);
 				ws.send(`[ERROR] Failed to decode MUD data: ${err.message}`);
@@ -50,6 +84,13 @@ wss.on('connection', (ws) => {
 		});
 
 		mudSocket.on('close', () => {
+			try {
+				const tail = streamDecoder.end();
+				const html = toHtmlChunk(tail, ansiToHtml, encoding);
+				if (html) ws.send(html);
+			} catch (err) {
+				console.error('Error flushing MUD stream:', err);
+			}
 			ws.close();
 			console.log('MUD connection closed');
 		});
@@ -60,10 +101,8 @@ wss.on('connection', (ws) => {
 			console.error('MUD socket error:', err);
 		});
 
-		// Forward data from WebSocket to MUD
 		ws.on('message', (message) => {
 			try {
-				// Ensure the message is properly encoded before sending to MUD
 				const encodedMessage = iconv.encode(message.toString(), encoding);
 				mudSocket.write(encodedMessage);
 			} catch (err) {
@@ -84,4 +123,6 @@ wss.on('connection', (ws) => {
 	});
 });
 
-console.log(`WebSocket-to-TCP proxy running on ws://${WS_HOST}:${WS_PORT}`);
+server.listen(WS_PORT, WS_HOST, () => {
+	console.log(`WebSocket-to-TCP proxy running on ws://${WS_HOST}:${WS_PORT}`);
+});
