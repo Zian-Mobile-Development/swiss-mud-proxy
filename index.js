@@ -5,6 +5,7 @@ const iconv = require('iconv-lite');
 const AnsiToHtml = require('ansi-to-html');
 const he = require('he');
 const { createStreamDecoder } = require('./streamDecoder');
+const { createTelnetFilter } = require('./telnetFilter');
 
 const WS_PORT = Number(process.env.PORT || 3000);
 const WS_HOST = '0.0.0.0';
@@ -61,6 +62,7 @@ wss.on('connection', (ws) => {
 
 		const encoding = profile.encoding || 'utf8';
 		const streamDecoder = createStreamDecoder(encoding);
+		const telnetFilter = createTelnetFilter();
 		const ansiToHtml = new AnsiToHtml({
 			escapeXML: true,
 			stream: true,
@@ -74,7 +76,8 @@ wss.on('connection', (ws) => {
 		// Stream decoded text through ANSI→HTML; do not split on TCP chunk boundaries.
 		mudSocket.on('data', (data) => {
 			try {
-				const text = streamDecoder.write(data);
+				const filteredData = telnetFilter.write(data);
+				const text = streamDecoder.write(filteredData);
 				const html = toHtmlChunk(text, ansiToHtml, encoding);
 				if (html) ws.send(html);
 			} catch (err) {
